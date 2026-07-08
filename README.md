@@ -133,7 +133,7 @@ lib/
 supabase-rls.sql  # Activa RLS + índices sobre las tablas ya creadas en Supabase
 ```
 
-## Posibles mejoras a futuro (para mencionar en entrevista)
+## Posibles mejoras a futuro 
 
 - Usar `documents` + `document_chunks` para RAG real con embeddings de
   Gemini (`text-embedding-004`, 768 dimensiones) en vez de mandar el PDF
