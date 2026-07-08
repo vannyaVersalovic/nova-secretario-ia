@@ -1,30 +1,32 @@
-import { setTaskStatus, deleteTaskById } from "../../../../lib/supabase";
+import { supabase } from "@/lib/supabase";
 
-// PATCH: marca/desmarca una tarea como hecha
 export async function PATCH(req, { params }) {
-  try {
-    const { done } = await req.json();
-    const task = await setTaskStatus(params.id, done ? "done" : "pending");
-    return Response.json({ task });
-  } catch (err) {
-    console.error(err);
-    return Response.json(
-      { error: err.message || "No se pudo actualizar la tarea." },
-      { status: 500 }
-    );
+  const { id } = params;
+  const body = await req.json();
+
+  const { data, error } = await supabase
+    .from("tasks")
+    .update({ status: body.status })
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("Error actualizando tarea:", error);
+    return Response.json({ error: "No se pudo actualizar la tarea." }, { status: 500 });
   }
+
+  return Response.json({ task: data });
 }
 
-// DELETE: elimina una tarea
 export async function DELETE(_req, { params }) {
-  try {
-    await deleteTaskById(params.id);
-    return Response.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    return Response.json(
-      { error: err.message || "No se pudo eliminar la tarea." },
-      { status: 500 }
-    );
+  const { id } = params;
+  const { error } = await supabase.from("tasks").delete().eq("id", id);
+
+  if (error) {
+    console.error("Error borrando tarea:", error);
+    return Response.json({ error: "No se pudo borrar la tarea." }, { status: 500 });
   }
+
+  return Response.json({ ok: true });
 }

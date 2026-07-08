@@ -1,82 +1,73 @@
-import { chatWithSecretary, processVoiceNote } from "../../../../lib/gemini";
-import { sendTelegramMessage, downloadTelegramFileAsBase64 } from "../../../../lib/telegram";
-import { insertTasks } from "../../../../lib/supabase";
+import { NextResponse } from "next/server";
+import { sendTelegramMessage, downloadTelegramFileAsBase64 } from "@/lib/telegram";
+import { processVoiceNote, chatWithSecretary } from "@/lib/gemini";
+import { insertTasks } from "@/lib/tasks";
 
-// Telegram llama a esta URL cada vez que le llega un mensaje al bot.
-// La protegemos con un "secret" en la query string para que nadie más pueda
-// invocarla (Telegram lo manda tal cual se lo configuramos en setWebhook).
 export async function POST(req) {
-  const url = new URL(req.url);
-  const secret = url.searchParams.get("secret");
-
-  if (!process.env.TELEGRAM_WEBHOOK_SECRET || secret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
-    return Response.json({ error: "unauthorized" }, { status: 401 });
+  // Chequeo simple: la URL debe incluir el secreto que definiste,
+  // así nadie más puede mandarle updates falsos a tu bot.
+  const secret = req.nextUrl.searchParams.get("secret");
+  if (secret !== process.env.TELEGRAM_WEBHOOK_SECRET) {
+    return NextResponse.json({ ok: false }, { status: 401 });
   }
 
-  let update;
-  try {
-    update = await req.json();
-  } catch {
-    // Update mal formado, no hay nada que hacer, pero igual respondemos 200
-    // para que Telegram no siga reintentando.
-    return Response.json({ ok: true });
+  const update = await req.json();
+  const message = update.message;
+
+  // Le confirmamos a Telegram que recibimos el update, aunque el
+  // procesamiento de abajo se demore un poco.
+  if (!message) {
+    return NextResponse.json({ ok: true });
   }
 
-  const message = update?.message;
-  const chatId = message?.chat?.id;
-
-  // Ignoramos cualquier update que no sea un mensaje con chat (ej. edits, etc.)
-  if (!message || !chatId) {
-    return Response.json({ ok: true });
-  }
+  const chatId = message.chat.id;
 
   try {
     if (message.voice) {
-      const audioBase64 = await downloadTelegramFileAsBase64(message.voice.file_id);
+      // 1. Descargamos el audio de la nota de voz
+      const audioBase64 = await downloadTelegramFileAsBase64(
+        message.voice.file_id
+      );
+
+      // 2. Se lo mandamos a Gemini: transcribe + separa ideas + crea tareas
       const { summary, actions } = await processVoiceNote({
         audioBase64,
-        mimeType: message.voice.mime_type || "audio/ogg",
+        mimeType: "audio/ogg",
       });
-      await applyActions(actions);
+
+      // 3. Guardamos las tareas creadas en Supabase
+      const allTasks = actions.flatMap((a) => a.tasks);
+      await insertTasks(allTasks, "telegram");
+
+      // 4. Le contestamos con el resumen
       await sendTelegramMessage(chatId, summary);
-    } else if (typeof message.text === "string" && message.text.trim()) {
-      // Nota: cada mensaje de Telegram se procesa sin historial previo.
-      // Si más adelante quieres que el bot recuerde la conversación por chat,
-      // habría que guardar el historial en Supabase también.
+    } else if (message.text) {
+      // Mensajes de texto: reusamos la misma lógica de chat/tareas que ya
+      // tenías en la web. Por ahora sin historial persistente (eso lo
+      // sumamos cuando armemos la memoria de largo plazo).
       const { answer, actions } = await chatWithSecretary({
         history: [],
         newMessage: message.text,
         documentInfo: null,
       });
-      await applyActions(actions);
+
+      const allTasks = actions.flatMap((a) => a.tasks);
+      await insertTasks(allTasks, "telegram");
+
       await sendTelegramMessage(chatId, answer);
     } else {
       await sendTelegramMessage(
         chatId,
-        "Por ahora solo entiendo mensajes de texto y notas de voz 🙂"
+        "Por ahora solo entiendo audios o texto 🙂"
       );
     }
   } catch (err) {
     console.error("Error procesando update de Telegram:", err);
-    try {
-      await sendTelegramMessage(
-        chatId,
-        "Tuve un problema procesando eso, ¿puedes intentar de nuevo?"
-      );
-    } catch {
-      /* si tampoco se pudo avisar, no hay más que hacer */
-    }
+    await sendTelegramMessage(
+      chatId,
+      "Uy, tuve un problema procesando eso. ¿Puedes intentar de nuevo?"
+    );
   }
 
-  // Siempre respondemos 200 para que Telegram no reintente el mismo update.
-  return Response.json({ ok: true });
-}
-
-async function applyActions(actions) {
-  if (!Array.isArray(actions)) return;
-  for (const action of actions) {
-    if (action.type === "add_tasks" && Array.isArray(action.tasks) && action.tasks.length) {
-      await insertTasks(action.tasks, "telegram");
-    }
-  }
+  return NextResponse.json({ ok: true });
 }
