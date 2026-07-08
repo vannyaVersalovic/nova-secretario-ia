@@ -4,25 +4,10 @@ import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 
 const SECRETARY_NAME = "Nova";
-const TASKS_KEY = "nova-tasks-v1";
 
-function loadTasks() {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(TASKS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveTasks(tasks) {
-  try {
-    window.localStorage.setItem(TASKS_KEY, JSON.stringify(tasks));
-  } catch {
-    /* localStorage no disponible, se ignora */
-  }
-}
+// Cada cuánto refrescamos las tareas para reflejar lo que agregue el bot de
+// Telegram sin que la persona tenga que recargar la página.
+const TASKS_POLL_MS = 8000;
 
 export default function Home() {
   // --- Chat state ---
@@ -39,18 +24,29 @@ export default function Home() {
   // --- Tasks ---
   const [tasks, setTasks] = useState([]);
   const [newTask, setNewTask] = useState("");
-  const [tasksLoaded, setTasksLoaded] = useState(false);
+  const [tasksError, setTasksError] = useState(null);
 
   const chatEndRef = useRef(null);
 
-  useEffect(() => {
-    setTasks(loadTasks());
-    setTasksLoaded(true);
-  }, []);
+  async function fetchTasks() {
+    try {
+      const res = await fetch("/api/tasks");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Error al cargar tareas.");
+      setTasks(data.tasks || []);
+      setTasksError(null);
+    } catch (err) {
+      setTasksError(err.message);
+    }
+  }
 
   useEffect(() => {
-    if (tasksLoaded) saveTasks(tasks);
-  }, [tasks, tasksLoaded]);
+    fetchTasks();
+    // Refrescamos cada cierto tiempo para que las tareas que agregue el bot
+    // de Telegram aparezcan también acá, sin recargar la página.
+    const interval = setInterval(fetchTasks, TASKS_POLL_MS);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -101,11 +97,13 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Error al consultar la IA.");
 
-      // Si Nova pidió agregar tareas, las creamos de verdad en el panel
+      // Si Nova pidió agregar tareas, las creamos de verdad en Supabase
       if (Array.isArray(data.actions)) {
         for (const action of data.actions) {
           if (action.type === "add_tasks" && Array.isArray(action.tasks)) {
-            action.tasks.forEach((t) => addTask(t));
+            for (const t of action.tasks) {
+              await addTask(t);
+            }
           }
         }
       }
@@ -118,19 +116,66 @@ export default function Home() {
     }
   }
 
-  function addTask(textOverride) {
-    const text = (textOverride ?? newTask).trim();
-    if (!text) return;
-    setTasks((t) => [...t, { id: Date.now() + Math.random(), text, done: false }]);
-    if (textOverride === undefined) setNewTask("");
+  async function addTask(titleOverride) {
+    const title = (titleOverride ?? newTask).trim();
+    if (!title) return;
+    if (titleOverride === undefined) setNewTask("");
+
+    try {
+      const res = await fetch("/api/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "No se pudo crear la tarea.");
+      setTasks((t) => [...t, data.task]);
+    } catch (err) {
+      setTasksError(err.message);
+    }
   }
 
-  function toggleTask(id) {
-    setTasks((t) => t.map((task) => (task.id === id ? { ...task, done: !task.done } : task)));
+  async function toggleTask(id) {
+    const current = tasks.find((t) => t.id === id);
+    if (!current) return;
+    const currentlyDone = current.status === "done";
+    // Optimista: actualizamos la UI y revertimos si falla la llamada
+    setTasks((t) =>
+      t.map((task) => (task.id === id ? { ...task, status: currentlyDone ? "pending" : "done" } : task))
+    );
+
+    try {
+      const res = await fetch(`/api/tasks/${id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ done: !currentlyDone }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "No se pudo actualizar la tarea.");
+      }
+    } catch (err) {
+      setTasksError(err.message);
+      setTasks((t) =>
+        t.map((task) => (task.id === id ? { ...task, status: current.status } : task))
+      );
+    }
   }
 
-  function deleteTask(id) {
+  async function deleteTask(id) {
+    const previous = tasks;
     setTasks((t) => t.filter((task) => task.id !== id));
+
+    try {
+      const res = await fetch(`/api/tasks/${id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || "No se pudo eliminar la tarea.");
+      }
+    } catch (err) {
+      setTasksError(err.message);
+      setTasks(previous);
+    }
   }
 
   return (
@@ -222,6 +267,7 @@ export default function Home() {
 
         <aside className="tasks-panel">
           <h2>Tareas</h2>
+          {tasksError && <p className="error">{tasksError}</p>}
           <form
             className="task-form"
             onSubmit={(e) => {
@@ -240,14 +286,14 @@ export default function Home() {
           <ul className="task-list">
             {tasks.length === 0 && <li className="task-empty">Sin tareas todavía.</li>}
             {tasks.map((task) => (
-              <li key={task.id} className={task.done ? "done" : ""}>
+              <li key={task.id} className={task.status === "done" ? "done" : ""}>
                 <label>
                   <input
                     type="checkbox"
-                    checked={task.done}
+                    checked={task.status === "done"}
                     onChange={() => toggleTask(task.id)}
                   />
-                  <span>{task.text}</span>
+                  <span>{task.title}</span>
                 </label>
                 <button className="del" onClick={() => deleteTask(task.id)} aria-label="Eliminar">
                   ×
